@@ -18,6 +18,7 @@ use Illuminate\Support\Facades\DB;
  * @property string $id
  * @property string|null $batch_id
  * @property string|null $idempotency_key
+ * @property Carbon|null $dispatched_at
  * @property Channel $channel
  * @property Priority $priority
  * @property string $recipient
@@ -58,6 +59,7 @@ class Notification extends Model
             'attempts' => 'integer',
             'scheduled_at' => 'datetime',
             'available_at' => 'datetime',
+            'dispatched_at' => 'datetime',
             'sent_at' => 'datetime',
             'failed_at' => 'datetime',
             'cancelled_at' => 'datetime',

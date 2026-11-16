@@ -39,9 +39,9 @@ class MetricsService
                 ),
                 'end_to_end' => $this->stats(
                     Notification::where('status', NotificationStatus::Sent)
-                        ->where('updated_at', '>=', $since)
+                        ->where('sent_at', '>=', $since)
                         ->whereNull('scheduled_at')
-                        ->latest('updated_at')
+                        ->latest('sent_at')
                         ->limit(self::SAMPLE_LIMIT)
                         ->get(['created_at', 'sent_at'])
                         ->map(fn (Notification $n) => (int) $n->created_at->diffInMilliseconds($n->sent_at))
@@ -93,9 +93,11 @@ class MetricsService
      */
     private function deliveryRates(\DateTimeInterface $since): array
     {
+        // Counted by when the result happened (sent_at / failed_at), not by updated_at, which also
+        // changes for unrelated reasons.
         $rows = Notification::selectRaw('channel, status, count(*) as total')
-            ->whereIn('status', [NotificationStatus::Sent, NotificationStatus::Failed])
-            ->where('updated_at', '>=', $since)
+            ->where(fn ($q) => $q->where('status', NotificationStatus::Sent)->where('sent_at', '>=', $since))
+            ->orWhere(fn ($q) => $q->where('status', NotificationStatus::Failed)->where('failed_at', '>=', $since))
             ->groupBy('channel', 'status')
             ->get();
 

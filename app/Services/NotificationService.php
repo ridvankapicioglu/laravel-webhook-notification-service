@@ -7,33 +7,41 @@ use App\Enums\NotificationStatus;
 use App\Jobs\SendNotification;
 use App\Models\Notification;
 use App\Models\NotificationBatch;
+use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use LogicException;
 use Symfony\Component\HttpKernel\Exception\ConflictHttpException;
+use Throwable;
 
 class NotificationService
 {
+    public function __construct(private readonly Dispatcher $bus) {}
+
     /**
-     * Creates a notification and queues it. If the idempotency key was already used,
-     * the existing notification is returned and nothing new is queued.
+     * Creates a notification and queues it. If the idempotency key was already used with the
+     * same payload, the existing notification is returned and nothing new is queued.
      *
      * @return array{0: Notification, 1: bool} the notification and whether it was created now
      */
     public function create(NotificationData $data): array
     {
         if ($data->idempotencyKey !== null && $existing = $this->findByIdempotencyKey($data->idempotencyKey)) {
-            return [$existing, false];
+            return [$this->ensureSamePayload($existing, $data), false];
         }
 
         try {
             $notification = Notification::create($this->attributes($data));
         } catch (UniqueConstraintViolationException) {
             // Two requests with the same key arrived at the same time and the other one won.
-            return [$this->findByIdempotencyKey((string) $data->idempotencyKey), false];
+            $existing = $this->findByIdempotencyKey((string) $data->idempotencyKey)
+                ?? throw new LogicException('Idempotency key conflict without an existing notification.');
+
+            return [$this->ensureSamePayload($existing, $data), false];
         }
 
         $this->dispatch($notification);
@@ -43,7 +51,8 @@ class NotificationService
 
     /**
      * Creates up to 1000 notifications in one transaction. Items whose idempotency key
-     * already exists are not created again; the existing notification is returned for them.
+     * already exists (with the same payload) are not created again; the existing
+     * notification is returned for them.
      *
      * @param  list<NotificationData>  $items
      * @return array{0: NotificationBatch, 1: Collection<int, Notification>}
@@ -58,10 +67,17 @@ class NotificationService
         $now = now();
         $rows = [];
         $ids = [];
+        $conflicts = [];
 
         foreach ($items as $item) {
             if ($item->idempotencyKey !== null && $existing->has($item->idempotencyKey)) {
-                $ids[] = $existing[$item->idempotencyKey]->id;
+                $found = $existing[$item->idempotencyKey];
+
+                if (! NotificationData::fromModel($found)->samePayloadAs($item)) {
+                    $conflicts[] = $item->idempotencyKey;
+                }
+
+                $ids[] = $found->id;
 
                 continue;
             }
@@ -76,6 +92,12 @@ class NotificationService
 
             $rows[] = $row;
             $ids[] = $row['id'];
+        }
+
+        if ($conflicts !== []) {
+            throw new ConflictHttpException(
+                'These idempotency keys were already used with a different payload: '.implode(', ', $conflicts)
+            );
         }
 
         try {
@@ -99,7 +121,7 @@ class NotificationService
 
         $all = Notification::whereKey($ids)->get()->keyBy('id');
 
-        $all->where('batch_id', $batch->id)->each(fn (Notification $notification) => $this->dispatch($notification));
+        $this->dispatchMany($all->where('batch_id', $batch->id)->values());
 
         // Keep the same order as the request.
         $notifications = collect($ids)->map(
@@ -130,12 +152,60 @@ class NotificationService
 
     public function dispatch(Notification $notification): void
     {
-        $job = SendNotification::dispatch($notification->id, $notification->channel->value)
-            ->onQueue($notification->priority->queue());
+        $this->dispatchMany(collect([$notification]));
+    }
 
-        if ($notification->available_at->isFuture()) {
-            $job->delay($notification->available_at);
+    /**
+     * Pushes one job per notification and records when it reached the queue.
+     *
+     * The notification is already saved in MySQL at this point. If Redis cannot be reached the
+     * error is logged and the row keeps dispatched_at = NULL; notifications:recover picks it up
+     * once Redis is back, so the API does not lose a request it has already accepted.
+     *
+     * @param  Collection<int, Notification>  $notifications
+     */
+    public function dispatchMany(Collection $notifications): void
+    {
+        $dispatched = [];
+
+        foreach ($notifications as $notification) {
+            $job = (new SendNotification($notification->id, $notification->channel->value))
+                ->onQueue($notification->priority->queue());
+
+            if ($notification->available_at->isFuture()) {
+                $job->delay($notification->available_at);
+            }
+
+            try {
+                $this->bus->dispatch($job);
+                $dispatched[] = $notification->id;
+            } catch (Throwable $e) {
+                Log::error('notification.dispatch_failed', [
+                    'notification_id' => $notification->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
         }
+
+        foreach (array_chunk($dispatched, 500) as $chunk) {
+            // toBase(): only dispatched_at changes; updated_at keeps tracking status changes.
+            Notification::whereKey($chunk)->toBase()->update(['dispatched_at' => now()]);
+        }
+    }
+
+    /**
+     * The same idempotency key with a different payload is a client error. Returning the old
+     * notification silently would hide it, so it is rejected with 409.
+     */
+    private function ensureSamePayload(Notification $existing, NotificationData $data): Notification
+    {
+        if (! NotificationData::fromModel($existing)->samePayloadAs($data)) {
+            throw new ConflictHttpException(
+                "Idempotency key '{$data->idempotencyKey}' was already used with a different payload."
+            );
+        }
+
+        return $existing;
     }
 
     /**

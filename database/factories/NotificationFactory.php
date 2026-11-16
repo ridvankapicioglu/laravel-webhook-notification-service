@@ -28,9 +28,17 @@ class NotificationFactory extends Factory
         ];
     }
 
+    /**
+     * Sets the status together with the timestamp the application writes for it.
+     */
     public function status(NotificationStatus $status): static
     {
-        return $this->state(fn () => ['status' => $status]);
+        return $this->state(fn () => ['status' => $status] + match ($status) {
+            NotificationStatus::Sent => ['sent_at' => now()],
+            NotificationStatus::Failed => ['failed_at' => now()],
+            NotificationStatus::Cancelled => ['cancelled_at' => now()],
+            default => [],
+        });
     }
 
     public function email(): static

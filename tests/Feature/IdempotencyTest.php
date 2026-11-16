@@ -78,6 +78,63 @@ class IdempotencyTest extends TestCase
         Queue::assertPushed(SendNotification::class, 2);
     }
 
+    public function test_same_key_with_a_different_payload_is_rejected(): void
+    {
+        $this->postJson('/api/notifications', $this->payload)->assertStatus(202);
+
+        $this->postJson('/api/notifications', ['content' => 'A different message'] + $this->payload)
+            ->assertStatus(409)
+            ->assertJsonPath('message', "Idempotency key 'order-42-shipped' was already used with a different payload.");
+
+        $this->assertSame('Your code is 1234', Notification::sole()->content);
+        Queue::assertPushed(SendNotification::class, 1);
+    }
+
+    public function test_same_key_with_only_the_default_priority_spelled_out_is_the_same_payload(): void
+    {
+        $this->postJson('/api/notifications', $this->payload)->assertStatus(202);
+        $this->postJson('/api/notifications', $this->payload + ['priority' => 'normal'])->assertStatus(200);
+    }
+
+    public function test_a_row_stored_before_this_check_existed_still_matches_a_retry(): void
+    {
+        // Created without going through the API, like a row written by an older version.
+        $existing = Notification::factory()->create([
+            'idempotency_key' => 'order-42-shipped',
+            'recipient' => '+905551234567',
+            'content' => 'Your code is 1234',
+        ]);
+
+        $this->postJson('/api/notifications', $this->payload)
+            ->assertStatus(200)
+            ->assertJsonPath('data.id', $existing->id);
+    }
+
+    public function test_a_retry_with_a_scheduled_time_in_milliseconds_is_the_same_payload(): void
+    {
+        $payload = $this->payload + ['scheduled_at' => now()->addHour()->format('Y-m-d\TH:i:s.vP')];
+
+        $first = $this->postJson('/api/notifications', $payload)->assertStatus(202);
+
+        $this->postJson('/api/notifications', $payload)
+            ->assertStatus(200)
+            ->assertJsonPath('data.id', $first->json('data.id'));
+    }
+
+    public function test_batch_with_a_reused_key_and_a_different_payload_creates_nothing(): void
+    {
+        $this->postJson('/api/notifications', $this->payload)->assertStatus(202);
+
+        $this->postJson('/api/notifications/batch', [
+            'notifications' => [
+                ['content' => 'Changed'] + $this->payload,
+                ['recipient' => '+905559999999', 'channel' => 'sms', 'content' => 'New'],
+            ],
+        ])->assertStatus(409);
+
+        $this->assertSame(1, Notification::count());
+    }
+
     public function test_batch_rejects_the_same_key_twice_in_one_request(): void
     {
         $this->postJson('/api/notifications/batch', [

@@ -3,38 +3,51 @@
 namespace App\Console\Commands;
 
 use App\Enums\NotificationStatus;
-use App\Enums\Priority;
 use App\Models\Notification;
 use App\Services\NotificationService;
 use Illuminate\Console\Command;
-use Illuminate\Contracts\Queue\Factory as QueueFactory;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\Log;
 
 /**
- * Safety net for notifications that lost their queue job:
- *  - a worker died (OOM, container restart) after claiming the notification, so it stays "processing";
- *  - redis lost its data, so "pending" notifications have no job left in the queue.
+ * Safety net for notifications that lost their queue job. Runs every minute.
+ *
+ *  - stuck:   a worker died (OOM, container restart) after claiming it, so it stays "processing";
+ *  - never queued: it was saved but pushing the job to Redis failed (dispatched_at is NULL);
+ *  - lost:    it is due but has not been picked up long after its job was pushed, e.g. Redis lost
+ *             its data. Checked per notification, so constant traffic or delayed (scheduled) jobs
+ *             in the same queue do not hide it.
  *
  * Re-dispatching is safe: a duplicated job cannot send twice because of the atomic claim.
  */
 class RecoverNotifications extends Command
 {
+    /** A due notification whose job was pushed this long ago and is still pending is treated as lost. */
+    public const LOST_AFTER_MINUTES = 15;
+
     protected $signature = 'notifications:recover {--limit=1000}';
 
     protected $description = 'Re-queue notifications that are stuck or lost their queue job';
 
-    public function handle(NotificationService $service, QueueFactory $queue): int
+    public function handle(NotificationService $service): int
     {
         $limit = (int) $this->option('limit');
 
         $stuck = $this->recoverStuck($service, $limit);
-        $lost = $this->recoverLost($service, $queue, $limit);
+        $neverQueued = $this->redispatch($service, $limit, Notification::query()
+            ->where('status', NotificationStatus::Pending)
+            ->whereNull('dispatched_at')
+            ->where('created_at', '<', now()->subMinute()));
+        $lost = $this->redispatch($service, $limit, Notification::query()
+            ->where('status', NotificationStatus::Pending)
+            ->where('available_at', '<', now()->subMinutes(self::LOST_AFTER_MINUTES))
+            ->where('dispatched_at', '<', now()->subMinutes(self::LOST_AFTER_MINUTES)));
 
-        if ($stuck + $lost > 0) {
-            Log::warning('notifications.recovered', ['stuck' => $stuck, 'lost' => $lost]);
+        if ($stuck + $neverQueued + $lost > 0) {
+            Log::warning('notifications.recovered', ['stuck' => $stuck, 'never_queued' => $neverQueued, 'lost' => $lost]);
         }
 
-        $this->info("Recovered {$stuck} stuck and {$lost} lost notifications.");
+        $this->info("Recovered {$stuck} stuck, {$neverQueued} never queued and {$lost} lost notifications.");
 
         return self::SUCCESS;
     }
@@ -67,30 +80,14 @@ class RecoverNotifications extends Command
     }
 
     /**
-     * Pending notifications that are due, while the queue of their priority is completely empty,
-     * can only mean the jobs were lost. Under normal load the queue is not empty, so this
-     * never creates duplicate jobs for a large backlog.
+     * @param  Builder<Notification>  $query
      */
-    private function recoverLost(NotificationService $service, QueueFactory $queue, int $limit): int
+    private function redispatch(NotificationService $service, int $limit, $query): int
     {
-        $recovered = 0;
+        $notifications = $query->orderBy('available_at')->limit($limit)->get();
 
-        foreach (Priority::cases() as $priority) {
-            if ($queue->connection()->size($priority->queue()) > 0) {
-                continue;
-            }
+        $service->dispatchMany($notifications);
 
-            Notification::where('status', NotificationStatus::Pending)
-                ->where('priority', $priority)
-                ->where('available_at', '<', now()->subMinute())
-                ->limit($limit)
-                ->get()
-                ->each(function (Notification $notification) use ($service, &$recovered) {
-                    $service->dispatch($notification);
-                    $recovered++;
-                });
-        }
-
-        return $recovered;
+        return $notifications->count();
     }
 }

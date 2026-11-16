@@ -4,6 +4,8 @@ namespace Tests\Feature;
 
 use App\Jobs\SendNotification;
 use App\Models\Notification;
+use App\Services\NotificationService;
+use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Queue;
 use Tests\TestCase;
@@ -97,6 +99,59 @@ class CreateNotificationTest extends TestCase
             'channel' => 'sms',
             'content' => str_repeat('a', 160),
         ])->assertStatus(202);
+    }
+
+    public function test_push_tokens_up_to_512_characters_are_stored(): void
+    {
+        $token = str_repeat('t', 512);
+
+        $id = $this->postJson('/api/notifications', ['recipient' => $token, 'channel' => 'push', 'content' => 'Hi'])
+            ->assertStatus(202)
+            ->json('data.id');
+
+        $this->assertSame($token, Notification::findOrFail($id)->recipient);
+
+        $this->postJson('/api/notifications', ['recipient' => $token.'t', 'channel' => 'push', 'content' => 'Hi'])
+            ->assertStatus(422)
+            ->assertJsonValidationErrors(['recipient']);
+    }
+
+    public function test_the_notification_is_kept_when_the_queue_is_unreachable(): void
+    {
+        // Redis down while the request comes in: the job cannot be pushed.
+        $bus = \Mockery::mock(Dispatcher::class);
+        $bus->shouldReceive('dispatch')->andThrow(new \RuntimeException('Connection refused'));
+        $this->app->instance(Dispatcher::class, $bus);
+
+        $id = $this->postJson('/api/notifications', [
+            'recipient' => '+905551234567', 'channel' => 'sms', 'content' => 'Saved anyway',
+        ])->assertStatus(202)->json('data.id');
+
+        // Accepted and stored; dispatched_at stays NULL so notifications:recover queues it later.
+        $notification = Notification::findOrFail($id);
+        $this->assertSame('pending', $notification->status->value);
+        $this->assertNull($notification->dispatched_at);
+    }
+
+    public function test_dispatched_at_is_recorded_once_the_job_is_queued(): void
+    {
+        $id = $this->postJson('/api/notifications', [
+            'recipient' => '+905551234567', 'channel' => 'sms', 'content' => 'Hi',
+        ])->json('data.id');
+
+        $this->assertNotNull(Notification::findOrFail($id)->dispatched_at);
+    }
+
+    public function test_recording_the_dispatch_does_not_touch_updated_at(): void
+    {
+        $notification = Notification::factory()->create(['updated_at' => now()->subHour()]);
+        $updatedAt = $notification->fresh()->updated_at;
+
+        app(NotificationService::class)->dispatch($notification);
+
+        $fresh = $notification->fresh();
+        $this->assertNotNull($fresh->dispatched_at);
+        $this->assertTrue($fresh->updated_at->equalTo($updatedAt));
     }
 
     public function test_it_can_schedule_a_notification_for_later(): void
