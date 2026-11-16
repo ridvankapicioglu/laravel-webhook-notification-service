@@ -7,6 +7,7 @@ delivery tracking.
 Built with Laravel 12 (PHP 8.3), MySQL 8, Redis and Laravel Horizon.
 
 - [Quick start](#quick-start)
+- [Configuration and secrets](#configuration-and-secrets)
 - [Architecture](#architecture)
 - [Delivery and retry logic](#delivery-and-retry-logic)
 - [API examples](#api-examples)
@@ -16,13 +17,26 @@ Built with Laravel 12 (PHP 8.3), MySQL 8, Redis and Laravel Horizon.
 
 ## Quick start
 
-Requirements: Docker with Docker Compose.
+Requirements: Docker with Docker Compose. No `.env` file or other setup is needed.
 
 ```bash
-docker compose up -d --build
+git clone https://github.com/ridvankapicioglu/laravel-webhook-notification-service.git
+cd laravel-webhook-notification-service
+docker-compose up
 ```
 
-That starts everything and runs the migrations. Then:
+That single command builds the image, starts every service and runs the migrations. Both spellings
+of the command work:
+
+| Command | |
+|---|---|
+| `docker-compose up` | Compose v1 style, as written in the assessment. Still shipped with Docker Desktop |
+| `docker compose up` | Compose v2 style (a Docker CLI plugin), the current default |
+
+Add `-d` to run it in the background, and `--build` to rebuild the image after changing the code.
+`docker compose down` stops everything; `docker compose down -v` also deletes the database.
+
+Once it is up:
 
 | URL | |
 |---|---|
@@ -39,14 +53,14 @@ curl -X POST http://localhost:8000/api/notifications \
 ### External provider (webhook.site)
 
 As the assessment asks, the external provider is simulated with webhook.site. Messages are sent to
-`https://webhook.site/6ae5e09c-75d6-4a28-931b-91043e0fbef6`, which is configured to answer:
+`https://webhook.site/924656b7-59d1-49ef-bde5-124930bd4665`, which is configured to answer:
 
 ```
-POST https://webhook.site/6ae5e09c-75d6-4a28-931b-91043e0fbef6
+POST https://webhook.site/924656b7-59d1-49ef-bde5-124930bd4665
 {"to": "+905551234567", "channel": "sms", "content": "Your message"}
 
 202 Accepted
-{"messageId": "9f0c5a43-1b7e-4c2a-9d1f-3e8a6b2c7d10", "status": "accepted", "timestamp": "2026-11-16T10:00:00Z"}
+{"messageId": "<uuid>", "status": "accepted", "timestamp": "<ISO 8601>"}
 ```
 
 To use your own URL: open https://webhook.site, in *Edit* set status `202`, content type
@@ -74,6 +88,24 @@ MOCK_FAILURE_RATE=0.3   # 30% of requests get a 500, 503 or 429, to watch the re
 ```
 
 The load test numbers below were measured against the mock.
+
+### Configuration and secrets
+
+There is no `.env` file in the repository, on purpose. `.env` holds secrets (application key,
+database passwords, API tokens) and is listed in `.gitignore`, as in any Laravel project.
+
+- **For this assessment** every value the stack needs has a default in `docker-compose.yml`, so it
+  runs with one command and no setup. Those defaults (`APP_KEY`, the `secret` database password)
+  are for local development only. The webhook.site URL is not a secret.
+- **`.env.example`** lists every setting the app reads. To change one, copy it to `.env`
+  (`cp .env.example .env`) and edit the values; Docker Compose picks up `.env` automatically and it
+  wins over the defaults.
+- **In a real deployment** nothing secret goes into the repository or the image: no `.env`, no
+  default passwords in `docker-compose.yml`. Values come from the environment of the platform
+  (Kubernetes secrets, AWS Secrets Manager / SSM, GitHub Actions secrets for CI), a new `APP_KEY`
+  is generated per environment (`php artisan key:generate --show`), database and Redis use strong
+  passwords, and a real provider's API token is stored the same way. If a secret is ever committed
+  by mistake, it is rotated, not just deleted from the history.
 
 ## Architecture
 
