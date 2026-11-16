@@ -3,10 +3,20 @@
 namespace Tests;
 
 use Illuminate\Foundation\Testing\TestCase as BaseTestCase;
+use Illuminate\Support\Facades\Http;
 use RuntimeException;
 
 abstract class TestCase extends BaseTestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        // Tests must never reach a real provider (e.g. use up the webhook.site request limit).
+        // Any HTTP call that is not faked fails the test instead of leaving the machine.
+        Http::preventStrayRequests();
+    }
+
     /**
      * RefreshDatabase (set up in here) drops every table. Make sure that can only ever happen
      * to the test database, never to the application's real one.

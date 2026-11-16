@@ -23,7 +23,7 @@ x-app: &app
     SESSION_DRIVER: array
     # The external provider is simulated with webhook.site, as the assessment asks.
     # For load / failure tests switch to the local mock: NOTIFICATION_PROVIDER_URL=http://mock-provider:8080
-    NOTIFICATION_PROVIDER_URL: ${NOTIFICATION_PROVIDER_URL:-https://webhook.site/6ae5e09c-75d6-4a28-931b-91043e0fbef6}
+    NOTIFICATION_PROVIDER_URL: ${NOTIFICATION_PROVIDER_URL:-https://webhook.site/924656b7-59d1-49ef-bde5-124930bd4665}
     NOTIFICATION_RATE_LIMIT: ${NOTIFICATION_RATE_LIMIT:-100}
     HORIZON_PROCESSES: ${HORIZON_PROCESSES:-20}
   depends_on:

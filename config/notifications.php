@@ -3,7 +3,7 @@
 return [
 
     'provider' => [
-        'url' => env('NOTIFICATION_PROVIDER_URL', 'https://webhook.site/6ae5e09c-75d6-4a28-931b-91043e0fbef6'),
+        'url' => env('NOTIFICATION_PROVIDER_URL', 'https://webhook.site/924656b7-59d1-49ef-bde5-124930bd4665'),
         'timeout' => (int) env('NOTIFICATION_PROVIDER_TIMEOUT', 5),
         'connect_timeout' => (int) env('NOTIFICATION_PROVIDER_CONNECT_TIMEOUT', 2),
     ],
