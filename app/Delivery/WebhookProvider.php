@@ -6,6 +6,7 @@ use App\Models\Notification;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Sends notifications to the external provider (webhook.site in the assessment setup).
@@ -51,6 +52,15 @@ class WebhookProvider implements NotificationProvider
             // Any 2xx means the provider has the message. We never retry it, even if the body is not
             // what we expected, otherwise the user could receive the same message twice.
             $messageId = $response->json('messageId');
+
+            // Still delivered, but make a provider answering outside the agreed contract visible.
+            if ($status !== 202 || ! is_string($messageId) || $response->json('status') !== 'accepted') {
+                Log::warning('provider.unexpected_response', [
+                    'status_code' => $status,
+                    'has_message_id' => is_string($messageId),
+                    'status_field' => $response->json('status'),
+                ]);
+            }
 
             return DeliveryResult::accepted($status, is_string($messageId) ? $messageId : null, $durationMs);
         }

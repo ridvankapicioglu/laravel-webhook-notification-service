@@ -12,6 +12,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Mockery;
 use Tests\TestCase;
 
@@ -51,8 +52,9 @@ class SendNotificationJobTest extends TestCase
             && $request->hasHeader('Idempotency-Key', $notification->id));
     }
 
-    public function test_a_2xx_without_the_expected_body_is_still_treated_as_sent(): void
+    public function test_a_2xx_without_the_expected_body_is_still_treated_as_sent_but_logged(): void
     {
+        Log::spy();
         Http::fake(['*' => Http::response('', 200)]);
         $notification = Notification::factory()->create();
 
@@ -60,6 +62,19 @@ class SendNotificationJobTest extends TestCase
 
         $this->assertSame(NotificationStatus::Sent, $notification->fresh()->status);
         Http::assertSentCount(1);
+        Log::shouldHaveReceived('warning')->with('provider.unexpected_response', Mockery::on(
+            fn (array $context) => $context['status_code'] === 200 && $context['has_message_id'] === false
+        ));
+    }
+
+    public function test_the_expected_202_answer_is_not_logged_as_unexpected(): void
+    {
+        Log::spy();
+        Http::fake(['*' => Http::response(['messageId' => 'm-1', 'status' => 'accepted', 'timestamp' => now()->toIso8601String()], 202)]);
+
+        $this->runJob(Notification::factory()->create());
+
+        Log::shouldNotHaveReceived('warning', ['provider.unexpected_response', Mockery::any()]);
     }
 
     public function test_server_error_schedules_a_retry_with_backoff(): void
@@ -88,6 +103,19 @@ class SendNotificationJobTest extends TestCase
         $this->runJob($notification)->assertReleased();
 
         $this->assertSame(NotificationStatus::Pending, $notification->fresh()->status);
+    }
+
+    public function test_a_very_long_error_message_is_stored_shortened(): void
+    {
+        Http::fake(fn () => throw new ConnectionException('cURL error 28: '.str_repeat('timed out ', 100)));
+        $notification = Notification::factory()->create();
+
+        $this->runJob($notification)->assertReleased();
+
+        $notification->refresh();
+        $this->assertSame(NotificationStatus::Pending, $notification->status);
+        $this->assertSame(255, mb_strlen($notification->last_error));
+        $this->assertSame(255, mb_strlen($notification->deliveryAttempts()->sole()->error));
     }
 
     public function test_429_respects_the_retry_after_header(): void
