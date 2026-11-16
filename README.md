@@ -10,6 +10,7 @@ Built with Laravel 12 (PHP 8.3), MySQL 8, Redis and Laravel Horizon.
 - [Configuration and secrets](#configuration-and-secrets)
 - [Architecture](#architecture)
 - [Delivery and retry logic](#delivery-and-retry-logic)
+  - [Rate limiting](#rate-limiting)
 - [API examples](#api-examples)
 - [Observability](#observability)
 - [Tests and code quality](#tests-and-code-quality)
@@ -161,7 +162,8 @@ app/
 ### Data model
 
 - `notifications`: one row per message, its status, attempt count, scheduling and result.
-  `idempotency_key` has a unique index.
+  `idempotency_key` has a unique index. `dispatched_at` is when its job was last pushed to the queue
+  (`NULL` = never reached the queue); writing it does not touch `updated_at`.
 - `notification_batches`: a batch request, notifications point to it with `batch_id`.
 - `notification_attempts`: every call made to the provider (status code, error, duration).
   This is what shows *why* a message was not delivered.
@@ -173,27 +175,44 @@ A notification waiting for a retry is `pending` with `attempts > 0` and `last_er
 
 What a worker does for each job:
 
-1. **Quick rate limit check.** If the channel's counter for the current second is already full,
-   the job goes back to the queue for the next second without touching the database.
+1. **Quick rate limit check.** If the channel's window is already full, the job goes back to the
+   queue for a second without touching the database.
 2. **Claim.** `UPDATE notifications SET status='processing', attempts=attempts+1 WHERE id=? AND status='pending'`.
    If no row changed, someone else already took it (or it was cancelled), and the job stops. This is
    what makes duplicated jobs harmless: the same notification can't be sent twice in parallel.
-3. **Take a rate limit slot** right before the call: `INCR` on a per-channel, per-second counter in
-   Redis, atomic across all workers. If there is no slot left, the claim is undone (the attempt is
-   not counted) and the job is released for the next second. The slot is taken this late on purpose:
-   taking it at the start of the job let calls drift into the next second under load, which showed
-   up as 103-111 calls per second in a load test. The limiter also re-takes the slot when the Redis
-   round trip itself crosses a second boundary.
+3. **Take a rate limit permit**, as the very last step before the call (see [Rate limiting](#rate-limiting)).
+   If there is none, the claim is undone (the attempt is not counted) and the job is released.
 4. **Send** to the provider with a 5 second timeout. The notification id is sent as an
    `Idempotency-Key` header, so a provider that supports it can drop duplicates.
 5. **Record** the attempt in `notification_attempts` (timestamped when the request was sent) and decide:
 
 | Provider response | Treated as | Result |
 |---|---|---|
-| any 2xx | accepted | `sent`. Never retried, even if the body is unexpected, to avoid double sending |
+| any 2xx | accepted | `sent`. Never retried, even if the body is unexpected, to avoid double sending. Anything other than `202` with `messageId` and `status: accepted` is logged as `provider.unexpected_response` |
 | 408, 5xx, connection error / timeout | temporary | retry with backoff |
 | 429 | temporary | retry, not earlier than `Retry-After` |
 | other 4xx | permanent | `failed` right away, sending again would give the same answer |
+
+Error messages longer than the 255-character column are shortened before they are stored, so a long
+connection error can't make the result write fail after the provider was already called.
+
+### Rate limiting
+
+At most 100 provider calls per channel in **any** one second, across all workers:
+
+- Each permit is a member of a Redis sorted set (one per channel) scored by its time in milliseconds.
+  A Lua script removes permits older than the window, counts the rest and adds a new one only if
+  there is room. Redis runs the script atomically, and the time comes from the Redis server
+  (`TIME`), so all workers share one clock and two of them can never take the last slot.
+- It is a sliding window, not a counter per calendar second: a counter allows 100 calls at the end
+  of one second and 100 more at the start of the next, 200 within a few milliseconds.
+- The permit is the last thing taken before the HTTP call (not at the start of the job, which let
+  calls drift into the next second: 103-111 calls per second in a load test).
+- The window is 1100 ms instead of 1000 ms (`NOTIFICATION_RATE_LIMIT_WINDOW_MS`). The time between
+  taking a permit and the request reaching the provider varies by a few tens of milliseconds under
+  load; measured at the provider, an exact 1000 ms window still let 105 requests arrive within one
+  second. With the 100 ms margin the maximum measured at the provider is 100. The cost is a
+  ceiling of ~91 instead of 100 calls per second.
 
 **Backoff.** Up to 5 attempts in total. Waits before attempts 2-5 are 10s, 30s, 90s and 270s, plus
 up to 20% random jitter. The jitter matters when a provider outage fails thousands of messages at
@@ -208,12 +227,18 @@ rate limit releases would use them up. The real count is the `attempts` column.
   and the full attempt history.
 - `POST /api/notifications/{id}/retry` puts a failed notification back in the queue with a fresh
   budget of attempts. The attempt history is kept and keeps counting (e.g. `#1: 404`, `#2: 202`).
-- `notifications:recover` runs every minute and covers two crash cases:
-  - a worker died while a notification was `processing` (OOM, container restart). After 5 minutes it
-    goes back to `pending` or to `failed` if no attempts are left;
-  - Redis lost its jobs. When a priority queue is completely empty but due `pending` notifications
-    exist, they are dispatched again. The empty-queue check keeps this from adding duplicate jobs
-    while a large backlog is still being processed.
+- If Redis cannot be reached when a request comes in, the notification is still saved and the API
+  still answers 202; the failed push is logged and `dispatched_at` stays `NULL`.
+- `notifications:recover` runs every minute. It looks at each notification, not at the queue size,
+  so constant traffic or scheduled jobs sitting in the same queue cannot hide a lost one:
+  - **stuck**: a worker died while a notification was `processing` (OOM, container restart). After
+    5 minutes it goes back to `pending`, or to `failed` if no attempts are left;
+  - **never queued**: `pending` with `dispatched_at IS NULL` for more than a minute (the push to Redis
+    failed). Dispatched again;
+  - **lost**: `pending`, due for more than 15 minutes and its job was pushed more than 15 minutes ago
+    (e.g. Redis lost its data). Dispatched again. Each one at most once per 15 minutes and at most
+    1000 per run, so a long backlog only gets a bounded number of extra jobs, which the claim makes
+    harmless.
 - Unexpected exceptions in the job (a bug, the database going away) are retried by the queue up
   to 3 times, after that the job is recorded in Horizon's failed jobs. If the exception happened
   after the claim, the notification is left in `processing` and the recovery command above picks it up.
@@ -229,6 +254,7 @@ curl -X POST localhost:8000/api/notifications -H 'Content-Type: application/json
   "priority": "normal", "idempotency_key": "invoice-1001"
 }'
 # 202 on first call; sending it again returns 200 with the same notification.
+# The same key with a different payload is a client error: 409, nothing is created or changed.
 
 # Schedule for later
 curl -X POST localhost:8000/api/notifications -H 'Content-Type: application/json' -d '{
@@ -267,14 +293,17 @@ Validation rules:
 | `content` | required; up to 160 chars for sms, 10000 for email, 1000 for push |
 | `priority` | `high`, `normal` (default) or `low` |
 | `scheduled_at` | optional ISO 8601 date in the future |
-| `idempotency_key` | optional, up to 128 chars |
+| `idempotency_key` | optional, up to 128 chars; reusing it with a different payload returns 409 |
 
 ## Observability
 
 - `GET /api/metrics`: queue depth per priority (ready / delayed / reserved), notification count
   per status, success and failure rate overall and per channel, provider latency and end-to-end
-  latency (avg, p50, p95, max). Rates and latency cover the last 60 minutes by default (`?window=15`).
-- `GET /api/health`: checks MySQL and Redis, returns `503` if one of them is down.
+  latency (avg, p50, p95, max). Rates and latency cover the last 60 minutes by default (`?window=15`),
+  counted by when each result happened (`sent_at` / `failed_at`).
+- `GET /api/health`: checks MySQL, Redis and the workers (a running Horizon master, which keeps a
+  heartbeat in Redis). Returns `503` if any of them is down; with Horizon stopped it switched to 503
+  within 15 seconds.
 - **Logs** are JSON lines on stderr (`docker compose logs -f horizon`). Every request gets an
   `X-Correlation-ID` (the client's own, or a generated one), which is returned in the response,
   stored on the notification and carried into the queued job through Laravel's `Context`. So one
@@ -295,13 +324,23 @@ docker compose exec app composer lint       # Pint
 Tests run on MySQL like the application, but in a separate `notifications_test` database that
 the mysql container creates on its first start (`docker/mysql/init`). The test bootstrap refuses
 to run against any database whose name does not end in `_test`, so the application's data is never
-touched. The queue and the HTTP client are faked, Redis is not used by the tests, and any HTTP
-call that is not faked fails the test (`Http::preventStrayRequests()`), so tests can never reach
-the real provider.
+touched. The queue and the HTTP client are faked, and any HTTP call that is not faked fails the
+test (`Http::preventStrayRequests()`), so tests can never reach the real provider. The rate limiter
+tests use real Redis (database 14, not the one the app uses), because the limiter is a Lua script.
 
 They cover the API (validation, batch limits, filters, pagination, cancel, idempotency), the
 delivery job (every provider response type, retry and attempt limits, duplicate jobs, manual
 retry), the rate limiter, recovery and the metrics / health endpoints.
+
+Two tests run real parallel processes (`pcntl_fork`, each with its own connections). The helper
+([`RunsInParallel`](tests/Concerns/RunsInParallel.php)) fails the test unless every process was
+forked, waited for and reported back without an error, so a crashing worker can't make it pass
+(checked by [`RunsInParallelTest`](tests/Feature/RunsInParallelTest.php)):
+
+- [`ConcurrentClaimTest`](tests/Feature/ConcurrentClaimTest.php): 10 workers load the same
+  notification and claim it at the same moment; exactly one wins.
+- [`RateLimitTest`](tests/Feature/RateLimitTest.php): 8 workers ask for 50 permits each at the same
+  time with a limit of 100; exactly 100 are granted.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs lint, static analysis and tests on MySQL, then
 starts the whole stack with Docker Compose (against the mock provider) and checks that a
@@ -313,28 +352,34 @@ Run locally with Docker Desktop (20 Horizon workers, mock provider with 50 ms la
 
 | Scenario | Result |
 |---|---|
-| 3000 SMS + 1000 Email in 4 batches | all 4000 sent in 41 s; max **100** provider calls in any second per channel; no attempt used up by rate limiting |
+| 3000 SMS + 1000 Email in 4 batches | all 4000 sent in ~50 s; measured at the provider (arrival times logged by the mock, in ms): max **100** requests per channel in any 1000 ms window, two runs; no attempt used up by rate limiting |
 | 300 low, 300 normal, 300 high SMS queued while workers were stopped, then workers started | high finished first, normal 8 s later, low 15 s later |
 | 300 SMS with 30% provider errors (500/503/429) | 299 sent after retries (219 on the 1st attempt, 62 on the 2nd, 14 on the 3rd, 4 on the 4th), 1 waiting for its 4th attempt |
 | provider returns 500 for every call | 1st retry after 12 s (10 s + jitter); `failed` after the 5th attempt; sent on the next retry once the provider is back |
 | Redis stopped, then MySQL stopped | `/api/health` answers 503 with the failing dependency; delivery resumes after both come back |
 
-The query used to check the rate limit:
-
-```sql
-SELECT n.channel, DATE_FORMAT(a.created_at, '%H:%i:%s') AS second, COUNT(*) AS calls
-FROM notification_attempts a JOIN notifications n ON n.id = a.notification_id
-GROUP BY n.channel, second ORDER BY calls DESC LIMIT 5;
-```
+The rate limit was checked from the provider side: the mock logs the arrival time of every request
+in milliseconds (`docker compose logs mock-provider`), and the busiest 1000 ms window was counted
+over those timestamps.
 
 ## Found and fixed during testing
 
-Every requirement was also checked against the running Docker stack, not only with unit tests.
-These problems only showed up that way:
+Every requirement was also checked against the running Docker stack, and the code went through a
+review afterwards. These are the problems found that way, each with what now guards against it:
 
 | Problem | How it showed up | Fix | What prevents it from coming back |
 |---|---|---|---|
-| Rate limit went over 100/s (103-111 calls in one second) | load test, counting provider calls per second in `notification_attempts` | the slot is taken right before the HTTP call, not at the start of the job, and taken again if the Redis round trip crosses a second boundary | load test re-run: max 100 per second per channel over 4000 messages |
+| Rate limit went over 100/s (103-111 calls in one second) | load test, counting provider calls per second in `notification_attempts` | the permit is taken right before the HTTP call, not at the start of the job | load test re-run |
+| A per-second counter still allowed ~200 calls across a second boundary, and the provider saw up to 105 requests in one second | code review, then measuring arrival times at the provider in ms | sliding-window limiter (Redis sorted set + Lua, Redis server time) with a 1100 ms window as a safety margin | `RateLimitTest` (incl. 8 parallel processes against real Redis); load test: max 100 in any 1000 ms window at the provider |
+| A job lost from Redis was never recovered while the queue had other jobs | code review; reproduced with a scheduled job sitting in the same queue | recovery decides per notification using `dispatched_at` instead of "is the queue empty" | `test_a_lost_job_is_recovered_even_while_the_queue_is_busy` |
+| A request accepted while Redis was down could be left without a job | code review | a failed push is logged, the row keeps `dispatched_at = NULL` and recovery queues it; the API still answers 202 | `test_the_notification_is_kept_when_the_queue_is_unreachable`, `test_notifications_that_never_reached_the_queue_are_dispatched` |
+| Push tokens of 256-512 characters passed validation but failed on insert (500) | code review; reproduced with a 300-character token | `recipient` widened to 512 in a new migration | `test_push_tokens_up_to_512_characters_are_stored` |
+| The same idempotency key with a different payload silently returned the old notification | code review | the request is compared with the stored notification's own fields (no extra hash column, so rows written before this check work too); a mismatch returns 409 | `test_same_key_with_a_different_payload_is_rejected`, the batch variant, `test_a_row_stored_before_this_check_existed_still_matches_a_retry` |
+| Recording the dispatch also changed `updated_at`, which the metrics used | code review | the dispatch write skips the timestamps; metrics count by `sent_at` / `failed_at` | `test_recording_the_dispatch_does_not_touch_updated_at`, `test_rates_count_results_by_when_they_happened_not_by_updated_at` |
+| Some settings in `.env.example` (rate limit window, max attempts, timeouts) never reached the containers | code review | every setting is passed through in `docker-compose.yml` | checked live: values from the environment are read by the workers |
+| The parallel tests did not check that every process finished | code review | shared helper that requires every process to report back without an error | `RunsInParallelTest` |
+| `/api/health` did not notice stopped workers | code review | health also checks for a running Horizon master | `test_health_returns_503_when_no_worker_is_running`; live: 503 within 15 s of stopping Horizon |
+| An error message longer than 255 characters would fail the result write after the provider was called | code review | errors are shortened before they are stored | `test_a_very_long_error_message_is_stored_shortened` |
 | A manual retry could send the message twice | `POST /notifications/{id}/retry` on a failed notification left it stuck in `processing` | attempt history numbering no longer restarts when the attempt budget is reset; before, the new attempt clashed with attempt #1 *after* the provider was called, and the recovery command would have sent it again | `test_a_manually_retried_notification_keeps_its_attempt_history` |
 | API answered 502 after the `app` container was recreated | nginx logs during the failure tests | nginx resolves `app` through Docker's DNS on every request instead of once at startup | checked by recreating `app` with a different IP |
 | The test suite could wipe the application database | running the tests inside the container emptied the `notifications` table | test settings use `<server force="true">` (Laravel reads `$_SERVER` first, where Docker puts its variables) and tests use their own `notifications_test` database | [`tests/TestCase.php`](tests/TestCase.php) refuses to run against a database whose name does not end in `_test` |
@@ -347,9 +392,13 @@ These problems only showed up that way:
 - **At-least-once, not exactly-once.** If the provider accepts a message but the worker dies before
   writing the result, the recovery will send it again. Sending the notification id as
   `Idempotency-Key` lets a real provider remove such duplicates; webhook.site does not.
-- **Rate limit window.** The limiter counts per calendar second. Within any one second a channel
-  never goes over 100 calls, but 100 at the end of one second and 100 at the start of the next is
-  possible. A sliding window would smooth that out at the cost of a more complex Redis script.
+- **Rate limit margin.** The limit holds where it matters, at the provider, because of a 100 ms
+  safety margin on the window. If the delay between permit and arrival grew beyond that (a very
+  slow network), the margin would have to grow with it; it is configurable for that reason.
+- **Lost-job recovery is time based.** A notification is re-queued if it has been due for 15
+  minutes without being picked up. During a backlog longer than that, some notifications get a
+  second job (bounded: once per 15 minutes each, 1000 per run); the claim makes the extra job a
+  no-op. A transactional outbox would avoid the extra jobs at the cost of another table and relay.
 - **Strict priority** means low priority messages wait while there is high priority work. That is
   the intended behaviour for flash sales and OTPs; a dedicated worker for `low` would avoid starvation
   if it became a problem.
