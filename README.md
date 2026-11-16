@@ -13,6 +13,7 @@ Built with Laravel 12 (PHP 8.3), MySQL 8, Redis and Laravel Horizon.
 - [API examples](#api-examples)
 - [Observability](#observability)
 - [Tests and code quality](#tests-and-code-quality)
+- [Found and fixed during testing](#found-and-fixed-during-testing)
 - [Design decisions and limitations](#design-decisions-and-limitations)
 
 ## Quick start
@@ -75,6 +76,17 @@ Free webhook.site URLs accept a limited number of requests. Once the limit is re
 answers `429 Request limit exceeded`; the service then treats every call as a temporary error and
 keeps retrying with backoff, so nothing is lost, but nothing is delivered either. If that happens,
 create your own URL as described above.
+
+#### Protecting the request limit
+
+An earlier URL ran out of requests during development because a 1000-message load test was sent
+to it. Since then the configured URL is only used for real deliveries:
+
+| Where | What keeps it away from webhook.site |
+|---|---|
+| Test suite | `Http::preventStrayRequests()` in [`tests/TestCase.php`](tests/TestCase.php): any HTTP call that is not faked fails the test instead of leaving the machine |
+| CI | the Docker smoke test sets `NOTIFICATION_PROVIDER_URL=http://mock-provider:8080` ([`ci.yml`](.github/workflows/ci.yml)) |
+| Load and failure tests | always run against the local mock provider (below) |
 
 ### Local mock provider (load and failure tests)
 
@@ -283,7 +295,9 @@ docker compose exec app composer lint       # Pint
 Tests run on MySQL like the application, but in a separate `notifications_test` database that
 the mysql container creates on its first start (`docker/mysql/init`). The test bootstrap refuses
 to run against any database whose name does not end in `_test`, so the application's data is never
-touched. The queue and the HTTP client are faked, Redis is not used by the tests.
+touched. The queue and the HTTP client are faked, Redis is not used by the tests, and any HTTP
+call that is not faked fails the test (`Http::preventStrayRequests()`), so tests can never reach
+the real provider.
 
 They cover the API (validation, batch limits, filters, pagination, cancel, idempotency), the
 delivery job (every provider response type, retry and attempt limits, duplicate jobs, manual
@@ -312,6 +326,21 @@ SELECT n.channel, DATE_FORMAT(a.created_at, '%H:%i:%s') AS second, COUNT(*) AS c
 FROM notification_attempts a JOIN notifications n ON n.id = a.notification_id
 GROUP BY n.channel, second ORDER BY calls DESC LIMIT 5;
 ```
+
+## Found and fixed during testing
+
+Every requirement was also checked against the running Docker stack, not only with unit tests.
+These problems only showed up that way:
+
+| Problem | How it showed up | Fix | What prevents it from coming back |
+|---|---|---|---|
+| Rate limit went over 100/s (103-111 calls in one second) | load test, counting provider calls per second in `notification_attempts` | the slot is taken right before the HTTP call, not at the start of the job, and taken again if the Redis round trip crosses a second boundary | load test re-run: max 100 per second per channel over 4000 messages |
+| A manual retry could send the message twice | `POST /notifications/{id}/retry` on a failed notification left it stuck in `processing` | attempt history numbering no longer restarts when the attempt budget is reset; before, the new attempt clashed with attempt #1 *after* the provider was called, and the recovery command would have sent it again | `test_a_manually_retried_notification_keeps_its_attempt_history` |
+| API answered 502 after the `app` container was recreated | nginx logs during the failure tests | nginx resolves `app` through Docker's DNS on every request instead of once at startup | checked by recreating `app` with a different IP |
+| The test suite could wipe the application database | running the tests inside the container emptied the `notifications` table | test settings use `<server force="true">` (Laravel reads `$_SERVER` first, where Docker puts its variables) and tests use their own `notifications_test` database | [`tests/TestCase.php`](tests/TestCase.php) refuses to run against a database whose name does not end in `_test` |
+| Horizon started workers one by one | only 6 of 10 workers running during a burst | `minProcesses` = `maxProcesses`, all 20 workers start at once | [`config/horizon.php`](config/horizon.php) |
+| webhook.site URL ran out of requests | a load test was sent to it | see [Protecting the request limit](#protecting-the-request-limit) | stray-request guard in tests, mock provider in CI |
+| Throughput stuck at 20 messages/s | every job took ~1 s | the mock provider ran PHP's single-threaded built-in server; it now runs 32 workers (`PHP_CLI_SERVER_WORKERS`). Only the test tool was affected | [`docker-compose.yml`](docker-compose.yml) |
 
 ## Design decisions and limitations
 
