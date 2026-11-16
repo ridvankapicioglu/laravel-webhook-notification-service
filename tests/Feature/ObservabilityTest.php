@@ -9,6 +9,8 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Str;
+use Laravel\Horizon\Contracts\MasterSupervisorRepository;
+use Mockery;
 use RuntimeException;
 use Tests\TestCase;
 
@@ -72,21 +74,63 @@ class ObservabilityTest extends TestCase
             ->assertJsonPath('latency_ms.provider.max', 300);
     }
 
-    public function test_health_is_ok_when_database_and_redis_are_up(): void
+    public function test_rates_count_results_by_when_they_happened_not_by_updated_at(): void
+    {
+        // Sent two hours ago, but the row was touched just now for some other reason.
+        Notification::factory()->status(NotificationStatus::Sent)->create([
+            'sent_at' => now()->subHours(2), 'updated_at' => now(),
+        ]);
+        Notification::factory()->status(NotificationStatus::Failed)->create([
+            'failed_at' => now()->subMinutes(5), 'updated_at' => now()->subHours(3),
+        ]);
+
+        $this->getJson('/api/metrics?window=60')
+            ->assertJsonPath('delivery.overall.sent', 0)
+            ->assertJsonPath('delivery.overall.failed', 1);
+    }
+
+    public function test_health_is_ok_when_database_redis_and_workers_are_up(): void
     {
         Redis::shouldReceive('connection->ping')->andReturn(true);
+        $this->workers(['running']);
 
         $this->getJson('/api/health')
             ->assertOk()
-            ->assertJson(['status' => 'ok', 'checks' => ['database' => 'up', 'redis' => 'up']]);
+            ->assertJson(['status' => 'ok', 'checks' => ['database' => 'up', 'redis' => 'up', 'workers' => 'up']]);
     }
 
     public function test_health_returns_503_when_a_dependency_is_down(): void
     {
         Redis::shouldReceive('connection->ping')->andThrow(new RuntimeException('Connection refused'));
+        $this->workers(['running']);
 
         $this->getJson('/api/health')
             ->assertStatus(503)
             ->assertJson(['status' => 'down', 'checks' => ['database' => 'up', 'redis' => 'down']]);
+    }
+
+    public function test_health_returns_503_when_no_worker_is_running(): void
+    {
+        Redis::shouldReceive('connection->ping')->andReturn(true);
+
+        $this->workers([]);
+        $this->getJson('/api/health')->assertStatus(503)->assertJsonPath('checks.workers', 'down');
+
+        // A paused Horizon does not deliver anything either.
+        $this->workers(['paused']);
+        $this->getJson('/api/health')->assertStatus(503)->assertJsonPath('checks.workers', 'down');
+    }
+
+    /**
+     * @param  list<string>  $statuses  status of each Horizon master supervisor
+     */
+    private function workers(array $statuses): void
+    {
+        $repository = Mockery::mock(MasterSupervisorRepository::class);
+        $repository->shouldReceive('all')->andReturn(
+            array_map(fn (string $status) => (object) ['name' => 'host-1', 'status' => $status], $statuses)
+        );
+
+        $this->app->instance(MasterSupervisorRepository::class, $repository);
     }
 }

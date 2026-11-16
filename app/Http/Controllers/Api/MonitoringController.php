@@ -9,6 +9,8 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Redis;
+use Laravel\Horizon\Contracts\MasterSupervisorRepository;
+use RuntimeException;
 use Throwable;
 
 class MonitoringController extends Controller
@@ -20,11 +22,18 @@ class MonitoringController extends Controller
         return response()->json($metrics->snapshot($window));
     }
 
-    public function health(): JsonResponse
+    public function health(MasterSupervisorRepository $supervisors): JsonResponse
     {
         $checks = [
             'database' => $this->check(fn () => DB::select('select 1')),
             'redis' => $this->check(fn () => Redis::connection()->ping()),
+            // Horizon masters keep a heartbeat in Redis and disappear from this list soon after they stop.
+            // Without a running one, notifications are accepted but never delivered.
+            'workers' => $this->check(function () use ($supervisors) {
+                if (collect($supervisors->all())->where('status', 'running')->isEmpty()) {
+                    throw new RuntimeException('No running Horizon supervisor.');
+                }
+            }),
         ];
 
         $healthy = ! in_array('down', $checks, true);

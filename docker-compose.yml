@@ -24,7 +24,12 @@ x-app: &app
     # The external provider is simulated with webhook.site, as the assessment asks.
     # For load / failure tests switch to the local mock: NOTIFICATION_PROVIDER_URL=http://mock-provider:8080
     NOTIFICATION_PROVIDER_URL: ${NOTIFICATION_PROVIDER_URL:-https://webhook.site/924656b7-59d1-49ef-bde5-124930bd4665}
+    # Every setting from .env.example is passed through, so a value in .env reaches the containers.
+    NOTIFICATION_PROVIDER_TIMEOUT: ${NOTIFICATION_PROVIDER_TIMEOUT:-5}
+    NOTIFICATION_PROVIDER_CONNECT_TIMEOUT: ${NOTIFICATION_PROVIDER_CONNECT_TIMEOUT:-2}
     NOTIFICATION_RATE_LIMIT: ${NOTIFICATION_RATE_LIMIT:-100}
+    NOTIFICATION_RATE_LIMIT_WINDOW_MS: ${NOTIFICATION_RATE_LIMIT_WINDOW_MS:-1100}
+    NOTIFICATION_MAX_ATTEMPTS: ${NOTIFICATION_MAX_ATTEMPTS:-5}
     HORIZON_PROCESSES: ${HORIZON_PROCESSES:-20}
   depends_on:
     mysql:
