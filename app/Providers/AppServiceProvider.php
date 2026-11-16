@@ -19,8 +19,9 @@ class AppServiceProvider extends ServiceProvider
         ));
 
         $this->app->bind(ChannelRateLimiter::class, fn ($app) => new ChannelRateLimiter(
-            cache: $app['cache']->store(),
-            perSecond: config('notifications.rate_limit_per_second'),
+            redis: $app['redis']->connection(),
+            perWindow: config('notifications.rate_limit_per_second'),
+            windowMs: config('notifications.rate_limit_window_ms'),
         ));
 
         $this->app->bind(RetryPolicy::class, fn () => new RetryPolicy(

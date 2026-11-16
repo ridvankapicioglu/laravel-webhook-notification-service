@@ -35,7 +35,7 @@ class SendNotification implements ShouldQueue
 
     public function handle(NotificationProvider $provider, RetryPolicy $retryPolicy, ChannelRateLimiter $rateLimiter): void
     {
-        // This second is already full for the channel: come back in the next one without touching the database.
+        // The channel's window is already full: come back a moment later without touching the database.
         if ($rateLimiter->isFull($this->channel)) {
             $this->release(1);
 
@@ -64,17 +64,17 @@ class SendNotification implements ShouldQueue
             return;
         }
 
-        // The slot is taken right before the call, so the call happens in the same second as the slot.
+        // History numbering keeps going after a manual retry (which resets the attempt budget),
+        // so it is not taken from $notification->attempts. Safe without a lock: we own the claim.
+        $attemptNumber = (int) $notification->deliveryAttempts()->max('attempt') + 1;
+
+        // Taken last, with nothing but the HTTP call after it, so the limit applies to when calls start.
         if (! $rateLimiter->attempt($this->channel)) {
             $notification->releaseClaim();
             $this->release(1);
 
             return;
         }
-
-        // History numbering keeps going after a manual retry (which resets the attempt budget),
-        // so it is not taken from $notification->attempts. Safe without a lock: we own the claim.
-        $attemptNumber = (int) $notification->deliveryAttempts()->max('attempt') + 1;
 
         $startedAt = now();
         $result = $provider->send($notification);

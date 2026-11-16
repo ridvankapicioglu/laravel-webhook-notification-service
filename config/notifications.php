@@ -8,8 +8,13 @@ return [
         'connect_timeout' => (int) env('NOTIFICATION_PROVIDER_CONNECT_TIMEOUT', 2),
     ],
 
-    // Messages per second, per channel. Shared by all workers through the redis cache store.
+    // At most this many provider calls per channel in any one second, shared by all workers (Redis).
     'rate_limit_per_second' => (int) env('NOTIFICATION_RATE_LIMIT', 100),
+
+    // The limit is enforced over a slightly longer window than one second. The time between taking a
+    // permit and the request reaching the provider varies by a few tens of milliseconds under load; with
+    // an exact 1000 ms window the provider saw up to 105 requests in one second in a load test.
+    'rate_limit_window_ms' => (int) env('NOTIFICATION_RATE_LIMIT_WINDOW_MS', 1100),
 
     'batch_limit' => 1000,
 

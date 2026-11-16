@@ -9,6 +9,9 @@
  * which is handy to watch the retry logic work.
  */
 
+// Arrival time in milliseconds, logged with every request so the rate limit can be checked from outside.
+$receivedAt = sprintf('%.3f', microtime(true));
+
 $failureRate = (float) (getenv('MOCK_FAILURE_RATE') ?: 0);
 $latencyMs = (int) (getenv('MOCK_LATENCY_MS') ?: 50);
 
@@ -39,7 +42,7 @@ if ($failureRate > 0 && mt_rand() / mt_getrandmax() < $failureRate) {
         header('Retry-After: 5');
     }
 
-    file_put_contents('php://stderr', "[mock-provider] {$status} {$body['channel']} {$body['to']}\n");
+    file_put_contents('php://stderr', "[mock-provider] {$receivedAt} {$status} {$body['channel']} {$body['to']}\n");
     echo json_encode(['error' => 'simulated failure']);
 
     return;
@@ -50,7 +53,7 @@ $bytes[6] = chr(ord($bytes[6]) & 0x0F | 0x40);
 $bytes[8] = chr(ord($bytes[8]) & 0x3F | 0x80);
 $messageId = vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($bytes), 4));
 
-file_put_contents('php://stderr', "[mock-provider] 202 {$body['channel']} {$body['to']} {$messageId}\n");
+file_put_contents('php://stderr', "[mock-provider] {$receivedAt} 202 {$body['channel']} {$body['to']} {$messageId}\n");
 
 http_response_code(202);
 echo json_encode([
